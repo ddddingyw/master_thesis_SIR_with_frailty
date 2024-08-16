@@ -1,0 +1,718 @@
+---
+title: "An EM Algorithm for Parameter Estimation in SIR Model with Heterogeneity in Susceptibility"
+author: "Yuwen Ding"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data Simulation
+
+## Data Generation
+```{r}
+# Function to generate data from an SIR model with heterogeneity
+
+gen_SIR_Z <- function(beta, gamma, S0, I0, R0, fvar=1) {
+  # Start with S0 susceptible, I0 infected and R0 recovered, at time t=0
+  T <- 0
+  S <- S0; I <- I0; R <- R0
+  n <- S0 + I0 + R0
+  dfr <- matrix(0, 2 * n, 5) # time, S, I, R, ev (1 for infection, 0 for recovery)
+  # Now generate frailty terms
+  Z <- rgamma(S0, shape = 1/fvar, rate = 1/fvar) # mean one, variance fvar
+  # Initialize
+  dfr[1, ] <- c(T, S, I, R, 1)
+  i <- 1
+  while (I > 0) { # run until no more infecteds left
+    i <- i + 1
+    # currently I infected, S susceptibles, determine rates
+    rate_inf <- beta * I * sum(Z) / n
+    rate_rem <- gamma * I
+    rate_tot <- rate_inf + rate_rem
+    # time point of new event
+    Tev <- rexp(1, rate_tot)
+    # determine type of event
+    ev <- sample(0:1, size = 1, prob = c(rate_rem, rate_inf))
+    # if infection (ev=1) then 
+    T <- T + Tev
+    if (ev==1) { # new infection
+      # select (at random) which susceptible got infected and remove
+      idx <- sample(1:S, size = 1, prob = Z)
+      Z <- Z[-idx] # remove the infected individual from Z
+      S <- S - 1
+      I <- I + 1
+    } else { # removal
+      I <- I - 1
+      R <- R + 1
+    }
+    dfr[i, ] <- c(T, S, I, R, ev)
+  }
+  dfr <- as.data.frame(dfr)
+  names(dfr) <- c("T", "S", "I", "R", "ev")
+  dfr <- subset(dfr, !(T == 0 & ev == 0))
+  return(dfr)
+}
+```
+
+```{r}
+# Generate data
+n <- 1000 
+beta <- 2 
+gamma <- 0.5
+set.seed(2023)
+dfr <- gen_SIR_Z(beta, gamma, I0 = 1, S0 = n-1, R0 = 0) 
+```
+
+```{r}
+# Plot data
+plot(dfr$T, dfr$I, type="s", lwd=2, xlab="Time", ylab="",
+     ylim=c(0, n), col="red")
+lines(dfr$T, dfr$I + dfr$R, type="s", lwd=2)
+lines(dfr$T, dfr$I + dfr$R + dfr$S, type="s", lwd=2, col="blue")
+legend(5, 0.8, c("I", "I + R", "I + R + S"), lwd=2,
+col=c("red", "black", "blue"), bty="n", xjust=1)
+```
+
+## Data Transformation
+```{r}
+library(survival)
+library(tidyverse)
+
+SIR2surv <- function(SIRdata)
+{
+  n <- SIRdata$S[1] + SIRdata$I[1] + SIRdata$R[1] # first extract the total size
+  wh <- which(SIRdata$ev == 1) # select the infection events
+  ninf <- length(wh) # number of observed infections in the time window
+  tinf <- SIRdata$T[wh]
+  d <- data.frame(id = 1:ninf, time = tinf, status = 1)
+  d$w <- 1 # give weight 1 to observed infections
+  # First is not really an observed event, so remove
+  d <- d[-1, ]
+  # Add the rest of the population to the data with number of never infecteds
+  d <- rbind(d, data.frame(id=ninf+1, time=max(SIRdata$T), status=0, w=n-ninf))
+  # Prepare long data format
+  tt <- SIRdata$T
+  dlong <- survSplit(Surv(time, status) ~ ., data=d, cut=tt[-1])
+  # Add proportion of infecteds as time-dependent covariate
+  dlong$pinf <- SIRdata$I[match(dlong$tstart, SIRdata$T)] / n
+  dlong$logpinf <- log(dlong$pinf)
+  dlong$fuptime <- dlong$time - dlong$tstart # length of follow-up interval
+  dlong$logfuptime <- log(dlong$fuptime) 
+  dlong$c_ij <- dlong$pinf * dlong$fuptime # Calculated for convenience
+  dlong <- subset(dlong, w>0) 
+  return(as_tibble(dlong))
+}
+```
+
+```{r}
+dlong2023 <- SIR2surv(dfr) #transformed dataset
+```
+
+
+# Profile EM algorithm
+
+## Prepare Functions 
+```{r}
+# Function to create long-format data frame with estimated Z_i in the E-step
+
+est_SIR_Z <- function(dlong, beta, delta) {
+
+  dfr_Z <- dlong %>%
+    group_by(id) %>%
+    reframe(y_i = sum(status), c_i = sum(c_ij)) 
+  
+  # Calculate Zi_hat
+  dfr_Z <- dfr_Z %>%
+    mutate(Z_i = (y_i + 1 / delta) / (beta * c_i + 1 / delta))
+  
+  # create long-format data frame with Zi and logZi
+  data <- merge(dlong, dfr_Z[, c("id", "Z_i")], by = "id")
+  return(data)
+}
+```
+
+```{r}
+# Function to calculate the observed data likelihood
+
+library(dplyr)
+
+obsloglik <- function(dlong, beta, delta) {
+  # Define nu and eta based on delta
+  nu <- eta <- 1 / delta
+  
+  # Summarize data by id and compute constants
+  dfr_Z <- dlong %>%
+    group_by(id) %>%
+    reframe(
+      y_i = sum(status),
+      c_i = sum(c_ij),
+      w = unique(w), #weight
+      C = (nu^eta / gamma(eta)) * prod((beta * c_ij)^status)
+    )
+  
+  # Update posterior parameters and calculate likelihood
+  dfr_Z <- dfr_Z %>%
+    mutate(
+      nu_post = beta * c_i + nu,
+      eta_post = y_i + eta,
+      likhood = C * gamma(eta_post) / (nu_post^eta_post),
+      loglik = w * log(likhood) #include weight
+    )
+  
+  # Calculate the observed data log-likelihood
+  obsloglik <- sum(dfr_Z$loglik)
+  return(obsloglik)
+}
+```
+
+## Grid Search
+
+### EM algorithm
+```{r}
+# Function with both beta and log-likelihood as output
+
+library(tidyverse)
+
+EM_alg = function(dlong, delta=1, max_iter=500) {
+  
+  # beta0
+  beta0 = sum(dlong$status*dlong$w)/sum(dlong$c_ij*dlong$w)
+  
+  # Calculate current log-likelihood for beta0
+  obsloglik0 = obsloglik(dlong, beta0, delta)
+  
+  # Pre-allocate vector with the expected size
+  beta <- numeric(max_iter)  
+  obsloglik <- numeric(max_iter)
+  
+  # Initial values
+  beta[1] = beta0
+  obsloglik[1] = obsloglik0
+  i = 1
+  epsilon = 1
+  
+  while (epsilon >= 10^(-4) && i < max_iter) {
+    # E-step: calculate Zi hat
+    dlong_Z = est_SIR_Z(dlong, beta[i], delta)
+    # M-step: update beta
+    beta_hat = sum(dlong_Z$status*dlong_Z$w)/sum(dlong_Z$c_ij*dlong_Z$w*dlong_Z$Z_i)
+      
+    # calculate observed data log-likelihood
+    loglik = obsloglik(dlong, beta_hat, delta) 
+    
+    # store values
+    i = i + 1
+    beta[i] = beta_hat
+    obsloglik[i] = loglik
+    epsilon = abs(obsloglik[i] - obsloglik[i - 1])
+  }
+  
+  # print the results
+  beta <- beta[1:i]
+  obsloglik <- obsloglik[1:i]
+  
+  #EM_dfr = data.frame(iter, beta, obsloglik) 
+  index_max = which.max(obsloglik) 
+  EM_opt =data.frame(delta = delta,
+                     beta_hat = beta[index_max], 
+                     obsloglik = obsloglik[index_max]) #the optimal pair
+  #print(list(EM_dfr, EM_opt))
+  return(EM_opt)
+}
+```
+
+### Optimization
+```{r}
+# Define a sequence of delta values
+delta_values <- seq(from = 0.1, to = 2, by = 0.1)
+
+# Apply the function to each delta value
+opt_list <- lapply(delta_values, function(x) EM_alg(dlong2023, delta = x))
+
+# Combine all dataframes into one dataframe
+results_grid <- do.call(rbind, opt_list)
+```
+
+```{r}
+# Compare the results for each pair
+max_row <- results_grid[which.max(results_grid$obsloglik), ]
+max_loglikelihood <- max_row$obsloglik
+best_beta <- max_row$beta_hat
+best_delta <- max_row$delta
+
+# Print the optimal values
+cat("Maximum Loglikelihood:", max_loglikelihood, "\n")
+cat("Beta MLE:", best_beta, "\n")
+cat("Delta MLE:", best_delta, "\n")
+```
+
+```{r}
+# Plotting
+ggplot(results_grid, aes(x = delta, y = obsloglik)) +
+  geom_line() +
+  geom_point() +
+  geom_text(aes(label = round(beta_hat, 2)), vjust = -1, size = 3) +  # betas above the points
+  labs(title = "Loglikelihood vs. Delta",
+       x = "Delta",
+       y = "Loglikelihood") +
+  theme_minimal()
+```
+
+
+## Continuous optimization
+
+### EM algorithm
+```{r}
+# Function for the EM algorithm with negative profile log-likelihood as output
+library(dplyr)
+
+EM_loglik = function(dlong, delta, max_iter) {
+
+  # beta0
+  beta0 = sum(dlong$status*dlong$w)/sum(dlong$c_ij*dlong$w)
+  
+  # Calculate current log-likelihood for beta0
+  obsloglik0 = obsloglik(dlong, beta0, delta)
+  
+  # Initial values
+  i = 1
+  epsilon = 1
+  beta = beta0
+  
+  while (epsilon >= 10^(-4) && i < max_iter) {
+    
+    # E-step: calculate Zi hat
+    dlong_Z = est_SIR_Z(dlong, beta, delta)
+    
+    # M-step: update beta
+    beta_hat = sum(dlong_Z$status*dlong_Z$w)/sum(dlong_Z$c_ij*dlong_Z$w*dlong_Z$Z_i)
+      
+    # calculate observed data log-likelihood
+    obsloglik1 = obsloglik(dlong, beta_hat, delta) 
+    
+    # store values
+    i = i + 1
+    epsilon = abs(obsloglik1 - obsloglik0)
+    beta = beta_hat
+    obsloglik0 = obsloglik1
+  }
+  return(-obsloglik0)
+}
+```
+
+```{r}
+# EM algorithm: Function with only beta as output
+
+library(dplyr)
+# Function for the EM algorithm given delta with optimized beta as output
+EM_beta = function(dlong, delta, max_iter=500) {
+
+  # beta0
+  beta0 = sum(dlong$status*dlong$w)/sum(dlong$c_ij*dlong$w)
+  
+  # Calculate current log-likelihood for beta0
+  obsloglik0 = obsloglik(dlong, beta0, delta)
+  
+  # Initial values
+  i = 1
+  epsilon = 1
+  beta = beta0
+  obsloglik = obsloglik0
+  
+  while (epsilon >= 10^(-4) && i < max_iter) {
+    
+    # E-step: calculate Zi hat
+    dlong_Z = est_SIR_Z(dlong, beta, delta)
+    
+    # M-step: update beta
+    beta_hat = sum(dlong_Z$status*dlong_Z$w)/sum(dlong_Z$c_ij*dlong_Z$w*dlong_Z$Z_i)
+      
+    # calculate observed data log-likelihood
+    obsloglik1 = obsloglik(dlong, beta_hat, delta) 
+    
+    # store values
+    i = i + 1
+    epsilon = abs(obsloglik1 - obsloglik)
+    beta = beta_hat
+    obsloglik = obsloglik1
+  }
+  
+  return(beta)
+}
+```
+
+```{r}
+# Function to calculate variance of beta given delta
+
+EM_beta_var = function(dlong, delta, beta) {
+  # full info
+  i_full <- sum(dlong$status * dlong$w)/(beta^2) #include weight
+  
+  # Summarize data by id and compute constants
+  df <- dlong %>%
+    group_by(id) %>%
+    reframe(y_i = sum(status), 
+            c_i = sum(c_ij), 
+            w = unique(w)) # include weight
+  
+  df$loss <- (df$w) * (df$c_i)^2 * (df$y_i + 1/delta) / ((beta * df$c_i + 1/delta)^2)
+  
+  # loss info
+  i_loss <- sum(df$loss)
+  
+  # Fisher information given a certain delta
+  i_EM = i_full - i_loss
+  
+  # Variance of beta hat given a certain delta
+  var_EM = 1/i_EM
+  
+  EM_var_beta = data.frame(var_EM = var_EM, 
+                           i_full = i_full,
+                           i_loss = i_loss)
+  
+  return(EM_var_beta)
+}
+```
+
+### Optimization
+```{r}
+EM_opt <- function(dflong, initial_delta=1, max_iteration = 500, 
+                   lowerbound = 0.01, upperbound = 4) {
+  
+  # Perform the optimization to find the delta_hat
+  delta_result <- optim(par = initial_delta, fn = EM_loglik,
+                        dlong =dflong, max_iter = max_iteration,
+                        lower = lowerbound, upper = upperbound,
+                        method = "L-BFGS-B", hessian = TRUE)
+  
+  # Check if the optimization succeeded
+  if (delta_result$convergence != 0) {
+    warning("Optimization did not converge.")
+  }
+  
+  ### FOR DELTA_HAT
+  
+  # Compute delta_hat
+  delta_hat <- round(delta_result$par, 4) 
+  # Extract the variance of delta_hat
+  delta_hessian <- delta_result$hessian
+  delta_var <- round(solve(delta_hessian),4)
+  # Construct the confidence interval of delta
+  delta_conf_l <- round(delta_hat - 1.96*sqrt(delta_var),4) #lower
+  delta_conf_u <- round(delta_hat + 1.96*sqrt(delta_var),4) #upper
+  
+  #delta_conf <- paste0("[", delta_conf_l, ", ", delta_conf_u, "]")
+  
+  
+  ### FOR BETA_HAT
+  beta_hat <- EM_beta(dflong, delta = delta_hat, max_iter = max_iteration)
+  beta_hat <- round(beta_hat, 4)
+  
+  ## Variance Part 1: variance of beta given a certain delta
+  beta_var_EM_df = EM_beta_var(dflong, delta_hat, beta_hat)
+  beta_var_EM = beta_var_EM_df$var_EM
+  ## Variance Part 2: variance of est
+  #calculate the derivative of beta(delta)
+  epsilon = 10^(-4) 
+  delta_lower = delta_hat - epsilon/2
+  delta_upper = delta_hat + epsilon/2 
+  beta_lower = EM_beta(dflong, delta_lower, max_iteration)
+  beta_upper = EM_beta(dflong, delta_upper, max_iteration)
+  slope = (beta_upper - beta_lower)/epsilon
+  beta_var_delta = slope^2*delta_var
+  # Final variance
+  beta_var = round(beta_var_EM + beta_var_delta, 4)
+  # Confidence interval of beta
+  beta_conf_l = round(beta_hat - 1.96*sqrt(beta_var),4)
+  beta_conf_u = round(beta_hat + 1.96*sqrt(beta_var),4)
+  #beta_conf <- paste0("[", beta_conf_l, ", ", beta_conf_u, "]")
+  
+  # Extract the final optimized beta and loglikelihood
+  final_result <- data.frame(delta = delta_hat,
+                             delta_var = delta_var,
+                             delta_conf_l = delta_conf_l,
+                             delta_conf_u = delta_conf_u,
+                             beta = beta_hat, 
+                             beta_var = beta_var,
+                             beta_conf_l = beta_conf_l,
+                             beta_conf_u = beta_conf_u)
+  
+  # Return the results as a data frame
+  return(final_result)
+}
+```
+
+```{r}
+start_time_s <- Sys.time()
+EM_opt(dlong2023)
+end_time_s <- Sys.time()
+
+#end_time_s - start_time_s
+```
+
+# Real-world Data Application
+
+## Data preparation
+
+Read data
+```{r}
+library(tidyverse)
+
+# Read raw data (January 1, 2020 to October 3, 2021)
+raw <- read.csv("https://data.rivm.nl/covid-19/COVID-19_casus_landelijk_tm_03102021.csv", 
+                sep = ";", head = TRUE, as.is = TRUE)
+head(raw)
+```
+
+Prepare working data
+```{r}
+# Prepare working data, rename and select columns
+work <- as_tibble(raw) %>% 
+  mutate(date = as.Date(Date_statistics), age = Agegroup, gender = Sex,
+         location = Province) %>% 
+  select(date, age, gender, location)
+
+# Prepare data with daily counts of newly infected cases
+daily <- work %>%
+  count(date) 
+first <- min(daily$date)
+last <- max(daily$date)
+daily <- daily %>% 
+  rename(newinf = n) %>% 
+  complete(date = seq(first, last, by = 1)) %>% # this adds NA's for days with 0
+  mutate(newinf = replace_na(newinf, 0)) %>% # replace NA's by 0
+  mutate(cuminf = cumsum(newinf)) # add cumulative number of infecteds
+daily
+
+# Plot of cumulative number of infecteds
+daily %>% ggplot(aes(date, cuminf)) + geom_line()
+```
+
+Use the SIR framework
+```{r}
+set.seed(2023)
+# Add number of susceptibles to the data
+# This will simply be n - cuminf, with n Dutch population size
+n <- 17407585 # Dutch population size at the end of December, 2019
+daily <- daily %>% 
+  mutate(S = n - cuminf, day = as.numeric(date - as.Date("2019-12-31")))
+
+# Now add number of infectives to the data
+# Let us revert to days (since start 2020)
+# Assumption is that we start out with 4 (newly) infected individuals at T=0,
+# and there is a distribution p, with p[j] containing probability of being infectious
+# j-1 days after infection. This distribution can be adapted; for now we follow
+# Lu's assumption that a newly infected individual stays infected (wp 1) for
+# seven days
+tau <- nrow(daily)
+eps <- 1e-10
+p <- rep(eps, tau+1); p[1:7] <- 1
+# Structure for analysis data, "empty" rows will be deleted later
+ana <- matrix(0, 2 * tau, 5) # columns are start, stop, ninf, status, weight
+# Initialize
+I0 <- 0
+vnewinf <- cuminf <- I0
+for (i in 1:tau) {
+  # Number of infected at start of bin (day)
+  ninf <- c(crossprod(vnewinf, rev(p[1:i])))
+  # Number of newly infected
+  newinf <- daily$newinf[i] # current newly infected
+  cuminf <- cuminf + newinf # cumulative number of infected
+  vnewinf <- c(vnewinf, newinf) # add newinf to vector vnewinf
+  # Construct two rows for analysis data
+  ana[2 * (i-1) + 1, ] <- c(i-1, i, ninf, 1, newinf)
+  ana[2 * (i-1) + 2, ] <- c(i-1, i, ninf, 0, n - cuminf)
+}
+
+# Make into data frame
+ana <- as.data.frame(ana)
+names(ana) <- c("Tstart", "Tstop", "ninf", "status", "weight")
+# Remove "empty" rows, days without new infections, weight will be zero
+ana <- subset(ana, weight > 0)
+ana <- as_tibble(ana)
+ana$ninf[1:2] <- 1
+ana$pinf <- ana$ninf / n
+ana$mid <- (ana$Tstart + ana$Tstop) / 2
+
+# Plot I(t)
+plot(ana$mid, ana$ninf, type = "l", lwd = 2,
+     xlab = "Days since outbreak detection",
+     ylab = "Number of infecteds")
+```
+
+Restrict our attention to the first 76 days
+```{r}
+ana76 <- ana[ana$Tstop <= 76, ]
+ana76 <- as_tibble(ana76) %>% 
+  mutate(pinf = ninf / n,
+         logpinf = log(pinf),
+         fuptime = 1,
+         logfuptime = log(fuptime))
+ana76$c_ij <- ana76$pinf * ana76$fuptime #new column
+
+#head(ana76, 20)
+#tail(ana76, 20)
+```
+
+Transform to long format
+```{r}
+# Calculate the number of data frames (stacks)
+num_stacks <- sum(ana76$status == 1) + 1 # +1 for the final stack with all 0s
+
+# Pre-allocate the list with the known number of data frames
+stacks <- vector("list", num_stacks)
+
+# Add the first stack
+first_stack <- ana76[1,]
+first_stack$id <- 1
+stacks[[1]] <- first_stack
+
+# Select the infection events
+wh <- which(ana76$status == 1) 
+wh1 <- wh[-1] 
+
+# Loop through the binary_col
+for (i in seq_along(wh1)) {
+  # Create a new stack including only the last row with 1
+  stack <- ana76[2:wh1[i], ]
+    
+  # Add the id column
+  stack <- stack %>% mutate(id = i+1)
+  # Find the index of the last row with infection
+  last_row_with_one <- tail(which(stack$status == 1), 1)
+  # Create a new data frame keeping only the last row with 1 and all rows with 0
+  filtered_stack <- stack %>% 
+    filter((status == 0) | (row_number() == last_row_with_one))
+  # Update the index of the last row with infection
+  last_row_with_one <- tail(which(filtered_stack$status == 1), 1)
+  # Set the weight to 0 for all rows except the last row with 1
+  filtered_stack <- filtered_stack %>% 
+    mutate(weight = if_else(row_number() != last_row_with_one, 0, weight))
+  # Add the new stack to the list of stacks
+  stacks[[i+1]] <- filtered_stack
+}
+
+# Add the final stack with all rows containing 0s
+final_stack <- ana76[ana76$status == 0, ]
+# Add id to the final stack
+final_stack$id <- length(wh)+1
+# Find the index of the last row
+last_row_index <- nrow(final_stack)
+# Set the weight to 0 for all rows except the last row
+final_stack <- final_stack %>% 
+  mutate(weight = if_else(row_number() != last_row_index, 0, weight))
+
+last_stack = length(wh)+1
+stacks[[last_stack]] <- final_stack
+
+# Combine all stacks into one long data frame
+long_df <- do.call(rbind, stacks)
+
+# Correct for weight
+long_df <- long_df %>%
+  group_by(id) %>%
+  mutate(weight = ifelse(weight == 0, max(weight), weight))
+
+#head(long_df, 30)
+#tail(long_df, 20)
+```
+
+```{r}
+#use the same notation as in the simulation studies to apply the same algorithm
+names(long_df)[names(long_df) == "weight"] <- "w"
+```
+
+
+## Assuming no frailty
+```{r}
+#Calculate beta_0
+beta0 = sum(long_df$status*long_df$w)/sum(long_df$c_ij*long_df$w)
+```
+
+```{r}
+#Calculate corresponding observed-data log-likelihood
+
+compute_log_likelihood <- function(beta, long_df) {
+  # Extract the columns from the data frame
+  y_ij <- long_df$status  # response variable
+  c_ij <- long_df$c_ij  # predictor variable
+  weight <- long_df$w  # weights
+  
+  # Compute lambda_ij = beta * c_ij
+  lambda_ij <- beta * c_ij
+  
+  # Compute the log-likelihood for each observation
+  log_likelihood <- weight * (y_ij * log(lambda_ij) - lambda_ij)
+  
+  # Return the sum of the log-likelihoods
+  return(sum(log_likelihood))
+}
+
+obsloglik0 = compute_log_likelihood(beta0, long_df)
+```
+
+## Considering frailty: Using earlier EM functions
+
+### Grid search
+```{r}
+# Define a sequence of delta values
+delta_values <- seq(from = 0.1, to = 2, by = 0.1)
+
+# Apply the function to each delta value
+opt_list <- lapply(delta_values, function(x) EM_alg(long_df, delta = x))
+
+# Combine all dataframes into one dataframe
+results_grid <- do.call(rbind, opt_list)
+```
+
+```{r}
+#Add data point for delta=0 (no frailty)
+results = rbind(results_grid, 
+                data.frame("delta" = 0, 
+                           "beta_hat" = beta0,
+                           "obsloglik" = obsloglik0))
+```
+
+```{r}
+# Compare the results for each pair
+max_row <- results[which.max(results$obsloglik), ]
+max_loglikelihood <- max_row$obsloglik
+best_beta <- max_row$beta_hat
+best_delta <- max_row$delta
+
+# Print the optimal values
+cat("Maximum Loglikelihood:", max_loglikelihood, "\n")
+cat("Beta MLE:", best_beta, "\n")
+cat("Delta MLE:", best_delta, "\n")
+```
+
+```{r}
+# Plot the results
+ggplot(results, aes(x = delta, y = obsloglik)) +
+  # Color the point at delta=0 red and all others black
+  geom_point(aes(color = delta == 0), size = 2) +
+  scale_color_manual(values = c("black", "red"), guide = "none") +  # Set the color scale manually and remove the legend
+  geom_text(aes(label = round(beta_hat, 4)), vjust = -1.5, size = 3) +  # Betas above the points
+  labs(x = expression(delta),
+       y = "Profile Log-likelihood",
+       caption = "Values above each point indicate the estimate of \u03B2(\u03B4)") +
+  theme_classic() +
+  ylim(min(results$obsloglik), max(results$obsloglik) + 0.01) +  # Adjust y-axis limits
+  
+  # Add a dashed line segment from min y to the point just below obsloglik at delta=0
+  geom_segment(
+    x = 0, xend = 0, 
+    y = min(results$obsloglik) - 0.004, 
+    yend = results$obsloglik[results$delta == 0] - 0.001, 
+    linetype = "dashed"
+  )
+```
+
+### Continuous Optimizaiton
+
+
+```{r}
+EM_opt(long_df)
+```
+
